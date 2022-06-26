@@ -25,3 +25,9 @@ arp poisoning attacks
    ```hash
    sudo cp src/01-hide-my-mac /etc/NetworkManager/dispatcher.d/
    ```
+
+3. Add execute permission
+
+   ```bash
+   sudo chmod +x /etc/NetworkManager/dispatcher.d/01-hide-my-mac
+   ```
