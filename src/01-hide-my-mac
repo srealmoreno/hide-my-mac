@@ -1,0 +1,202 @@
+#!/bin/bash
+
+MATCH_IP_WITH_MAC=true
+
+ENABLE_REQUEST=false
+ENABLE_MULTI_GW=false
+
+HOSTS_WHITE_LIST=(
+  #	192.168.1.22
+  # mycomputer.local
+)
+
+SSID_WHITE_LIST=(
+  # my-ssid
+)
+
+USE_CUSTOM_DNS=true
+CUSTOM_DNS_SERVERS=(
+  1.1.1.1
+  # "8.8.8.8"
+)
+
+ENABLE_DHCP_RELEASE=false
+
+function msg_info() {
+  echo -e "\e[7;36m  INFO  \e[m $*"
+}
+
+function msg_waring() {
+  echo -e "\e[7;33m WARNING \e[m $*" >&2
+}
+
+function msg_error() {
+  echo -e "\e[7;31m  ERROR  \e[m $*" >&2
+  exit 1
+}
+
+function is_ipv4() {
+  local -r IP="$1"
+  local -r IP_REGEX='^(?:[01]?[0-9][0-9]?|2[0-4][0-9]|25[0-5])(?:\.(?:[01]?[0-9][0-9]?|2[0-4][0-9]|25[0-5])){3}$'
+
+  grep -qoP "$IP_REGEX" <<<"$IP"
+}
+
+function resolve_mac() {
+  local MAC
+  local -r IP="$1"
+
+  for _ in {1..5}; do
+    timeout 2 bash -c "</dev/tcp/$IP/80" 2>/dev/null
+    if [ $? -ne 124 ]; then
+      MAC=$(ip neigh show dev "$IFACE" "$IP" | cut -f3 -d ' ')
+      if [ "$MAC" != "" ] && [[ ! "$MAC" =~ FAILED|INCOMPLETE ]]; then
+        echo "$MAC"
+        return 0
+      else
+        return 1
+      fi
+    fi
+  done
+  return 1
+}
+
+function resolve_host() {
+  local -r HOST="$1"
+  dig +short +search "$HOST" | tail -n1
+}
+
+function is_ip_local() {
+  local -r IP="$1"
+  ip -o route get "$IP" 2>/dev/null | grep -q ^"$IP dev $IFACE src $IP_ADRRESS"
+}
+
+function set_dns() {
+  local -r FLAG="${DNS_SERVERS[*]/#/--set-dns=}"
+  eval systemd-resolve "$FLAG" --interface="$IFACE"
+  msg_info "systemd-resolve '$FLAG' --interface='$IFACE'"
+}
+
+function add_host_arptables_whitelist() {
+  local -r HOST="$1"
+  local IP MAC
+  local SOURCE_MAC_FLAG CODE_IN_FLAG CODE_OUT_FLAG
+
+  if is_ipv4 "$HOST"; then
+    IP="$HOST"
+  else
+    IP=$(resolve_host "$HOST")
+    if [ "$IP" == "" ]; then
+      msg_waring "Could not resolve host '$HOST'"
+      return 1
+    fi
+  fi
+
+  if ! is_ip_local "$IP"; then
+    msg_waring "Host '$HOST' ($IP) is't local, skipping..."
+    return 0
+  fi
+
+  if $MATCH_IP_WITH_MAC; then
+    MAC=$(resolve_mac "$IP")
+
+    if [ "$MAC" == "" ]; then
+      msg_waring "Could not resolve mac for Host '$HOST' ($IP)"
+      return 1
+    fi
+
+    SOURCE_MAC_FLAG="--source-mac $MAC"
+  fi
+
+  if ! $ENABLE_REQUEST; then
+    CODE_IN_FLAG="--opcode 2"  # REPLY
+    CODE_OUT_FLAG="--opcode 1" # REQUEST
+  fi
+
+  eval arptables -A INPUT --source-ip "$IP" "$SOURCE_MAC_FLAG" --in-interface "$IFACE" "$CODE_IN_FLAG" -j ACCEPT || return 1
+  eval arptables -A OUTPUT --destination-ip "$IP" --out-interface "$IFACE" "$CODE_OUT_FLAG" -j ACCEPT
+}
+
+function start() {
+  local -a HOSTS_ADDED
+  local HOST
+
+  for HOST in "${HOSTS[@]}"; do
+    if [[ " ${HOSTS_ADDED[*]} " =~ \ $HOST\  ]]; then
+      msg_waring "Host '$HOST' duplicated, skipping..."
+      continue
+    fi
+
+    if add_host_arptables_whitelist "$HOST"; then
+      HOSTS_ADDED+=("$HOST")
+    else
+      msg_waring "Could not add host '$HOST' to arptables whitelist"
+    fi
+  done
+
+  if $USE_CUSTOM_DNS; then
+    set_dns
+  fi
+
+  if [ "${#HOSTS_ADDED[@]}" -eq 0 ]; then
+    msg_error "No hosts added to arptables whitelist"
+  else
+    arptables -A INPUT --in-interface "$IFACE" -j DROP
+    arptables -A OUTPUT --out-interface "$IFACE" -j DROP
+  fi
+}
+
+function stop() {
+  arptables -F INPUT --in-interface "$IFACE"
+  arptables -F OUTPUT --in-interface "$IFACE"
+}
+
+function init_vars() {
+  ACTION="$NM_DISPATCHER_ACTION"
+  # declare SUBNET=$(ip route show dev "$IFACE"| awk "/proto/ && \$NF=$DHCP4_IP_ADDRESS {print \$1}")
+  IFACE="$DEVICE_IFACE"
+  SSID="$CONNECTION_ID"
+  IP_ADRRESS="$DHCP4_IP_ADDRESS"
+
+  if $ENABLE_MULTI_GW; then
+    ROUTERS=("$DHCP4_ROUTERS")
+  else
+    ROUTERS=("$IP4_GATEWAY")
+  fi
+
+  if $USE_CUSTOM_DNS; then
+    DNS_SERVERS=("${CUSTOM_DNS_SERVERS[@]}")
+  else
+    DNS_SERVERS=("$DHCP4_DOMAIN_NAME_SERVERS")
+  fi
+
+  HOSTS=("${ROUTERS[@]}" "${HOSTS_WHITE_LIST[@]}" "${DNS_SERVERS[@]}")
+
+  if $ENABLE_DHCP_RELEASE; then
+    HOSTS+=("$DHCP4_NEXT_SERVER")
+  fi
+}
+
+function main() {
+  declare ACTION IFACE SSID IP_ADRRESS
+  declare -a ROUTERS DNS_SERVERS HOSTS
+
+  init_vars
+  case "$ACTION" in
+  up)
+    if printf '%s\0' "${SSID_WHITE_LIST[@]}" | grep -Fqxz -- "$SSID"; then
+      msg_info "The ssid: '$SSID' is on a whitelist"
+      exit 0
+    fi
+    stop
+    start
+    msg_info 'arptables rules established'
+    ;;
+  down)
+    stop
+    #msg_info "Rules eliminated"
+    ;;
+  esac
+}
+
+main >>/tmp/hide-my-mac.log 2>&1
